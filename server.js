@@ -23,7 +23,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.use('/audio', express.static(path.join(__dirname, 'audio')));
 app.use(express.json());
 
-const ADMIN_PHONE = '251934255415';
+const ADMIN_PHONE = '251900310944';
 function isAdminPhone(phone) {
   if (!phone) return false;
   const normalized = String(phone).replace(/^\+/, '');
@@ -717,6 +717,41 @@ function adminAuth(req,res,next){
   if(cl&&cl.isAdmin) return next();
   res.status(403).json({error:'Forbidden'});
 }
+
+app.get('/api/admin/admins', adminAuth, async(req,res)=>{
+  if(!db) return res.json([]);
+  try{
+    const rows=await db.q('SELECT telegram_id,name,phone FROM users WHERE is_admin=true ORDER BY name');
+    res.json(rows);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post('/api/admin/admins', adminAuth, async(req,res)=>{
+  if(!db) return res.json({ok:true});
+  const phone=String(req.body.phone||'').trim().replace(/^\+/,'');
+  if(!phone) return res.status(400).json({error:'phone required'});
+  try{
+    const r=await db.q('UPDATE users SET is_admin=true WHERE phone=$1 RETURNING telegram_id,name,phone',[phone]);
+    if(!r.length) return res.status(404).json({error:'User not found'});
+    const cl=Object.values(clients).find(c=>c.telegramId===String(r[0].telegram_id));
+    if(cl) cl.isAdmin=true;
+    if(userCache[String(r[0].telegram_id)]) userCache[String(r[0].telegram_id)].isAdmin=true;
+    res.json({ok:true,user:r[0]});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.delete('/api/admin/admins/:phone', adminAuth, async(req,res)=>{
+  if(!db) return res.json({ok:true});
+  const phone=decodeURIComponent(req.params.phone).replace(/^\+/,'');
+  if(phone===ADMIN_PHONE) return res.status(403).json({error:'Cannot remove root admin'});
+  try{
+    const r=await db.q('UPDATE users SET is_admin=false WHERE phone=$1 RETURNING telegram_id',[phone]);
+    if(r[0]){
+      const cl=Object.values(clients).find(c=>c.telegramId===String(r[0].telegram_id));
+      if(cl) cl.isAdmin=false;
+      if(userCache[String(r[0].telegram_id)]) userCache[String(r[0].telegram_id)].isAdmin=false;
+    }
+    res.json({ok:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 
 app.get('/api/admin/deposits', adminAuth, async(req,res)=>{
   if(!db) return res.json([]);
