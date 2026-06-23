@@ -3,7 +3,7 @@
  * Changes:
  *  - 80% winner / 20% house cut
  *  - Disqualification only notifies the cheater (silent to others)
- *  - Admin page (phone 251934255415 → admin)
+ *  - Admin page (phone 251900310944 → admin)
  *  - Deposit/withdrawal requests with approve/reject
  *  - Full DB integration
  */
@@ -41,7 +41,13 @@ let db = null;
 if (process.env.DATABASE_URL) {
   try {
     const { Pool } = require('pg');
-    const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    const pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+      max: 20,                      // cap concurrent DB connections
+      idleTimeoutMillis: 30000,     // close idle connections after 30s
+      connectionTimeoutMillis: 5000 // fail fast instead of hanging under load
+    });
 
     db = {
       q: (sql, p) => pool.query(sql, p).then(r => r.rows),
@@ -219,6 +225,16 @@ if (process.env.DATABASE_URL) {
         if (num)  PAYMENT_INFO.telebirrNumber = num;
         if (name) PAYMENT_INFO.telebirrName   = name;
       } catch (e) { console.error('⚠️ Settings load:', e.message); }
+
+      // Clean up any games left in 'playing' state from a previous crashed session
+      try {
+        const stale = await db.q(
+          `UPDATE games SET status='finished', ended_at=NOW(), win_amount=0
+           WHERE status='playing' AND started_at < NOW() - INTERVAL '2 hours'
+           RETURNING id`
+        );
+        if(stale.length) console.log(`🧹 Cleaned up ${stale.length} stale playing game(s):`, stale.map(r=>r.id));
+      } catch(e) { console.error('⚠️ Stale game cleanup:', e.message); }
     }).catch(e => { console.error('❌ DB:', e.message); db = null; });
   } catch(e) { console.log('⚠️ pg error:', e.message); }
 } else {
@@ -292,14 +308,37 @@ function getOrCreateRoom(sid){
 const send=(ws,msg)=>{if(ws&&ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify(msg));};
 const broadcast=(room,msg)=>{const s=JSON.stringify(msg);room.players.forEach(p=>{if(p.ws&&p.ws.readyState===WebSocket.OPEN)p.ws.send(s);});};
 function broadcastLobby(){
-  const payload=STAKES.map(s=>{const r=Object.values(rooms).find(r=>r.stakeId===s.id);
-    return{stakeId:s.id,amount:s.amount,maxPlayers:s.maxPlayers,playerCount:r?r.players.length:0,status:r?r.status:'waiting',countdown:r&&r.status==='countdown'?r.countdownLeft:0};});
-  Object.values(clients).forEach(c=>{if(!c.roomId)send(c.ws,{type:'lobbyUpdate',stakes:payload});});
+  // Debounced: many joins/leaves happening in quick succession (busy lobby with
+  // hundreds of players) will collapse into a single broadcast every 250ms,
+  // instead of one full broadcast-to-everyone per event.
+  if(broadcastLobby._pending) return;
+  broadcastLobby._pending=true;
+  setTimeout(()=>{
+    broadcastLobby._pending=false;
+    const payload=STAKES.map(s=>{const r=Object.values(rooms).find(r=>r.stakeId===s.id);
+      return{stakeId:s.id,amount:s.amount,maxPlayers:s.maxPlayers,playerCount:r?r.players.length:0,status:r?r.status:'waiting',countdown:r&&r.status==='countdown'?r.countdownLeft:0};});
+    const payloadStr=JSON.stringify({type:'lobbyUpdate',stakes:payload});
+    Object.values(clients).forEach(c=>{if(!c.roomId&&c.ws&&c.ws.readyState===WebSocket.OPEN)c.ws.send(payloadStr);});
+  },250);
 }
 function broadcastCardPool(room){
+  // Send only the FULL pool once when needed (e.g. on join); for live picks use broadcastCardDiff instead.
   const base=CARD_POOL.map(c=>({id:c.id,taken:room.takenCardIds.has(c.id)}));
   const cardCount=room.players.reduce((sum,p)=>(p.cardId?sum+1:sum)+(p.cardId2?1:0),0);
-room.players.forEach(p=>send(p.ws,{type:'cardPoolUpdate',pool:base.map(c=>({...c,takenByMe:p.cardId===c.id||p.cardId2===c.id})),playerCount:cardCount,stakeAmount:room.stake}));
+  room.players.forEach(p=>send(p.ws,{type:'cardPoolUpdate',pool:base.map(c=>({...c,takenByMe:p.cardId===c.id||p.cardId2===c.id})),playerCount:cardCount,stakeAmount:room.stake}));
+}
+// Lightweight update: tell everyone in the room only WHICH card(s) changed state,
+// instead of re-sending the entire 400-card array on every single pick.
+// This is the #1 fix for handling 400 concurrent players smoothly.
+function broadcastCardDiff(room, changedCardIds){
+  const cardCount=room.players.reduce((sum,p)=>(p.cardId?sum+1:sum)+(p.cardId2?1:0),0);
+  const changes=changedCardIds.map(id=>({id,taken:room.takenCardIds.has(id)}));
+  room.players.forEach(p=>send(p.ws,{
+    type:'cardPoolDiff',
+    changes:changes.map(c=>({...c,takenByMe:p.cardId===c.id||p.cardId2===c.id})),
+    playerCount:cardCount,
+    stakeAmount:room.stake
+  }));
 }
 
 // ─── GAME LIFECYCLE ──────────────────────────────────────────
@@ -338,10 +377,11 @@ async function startGame(room){
   room.status='playing';
   // Count paid cards (each card = one stake)
   const paidCards=room.players.reduce((s,p)=>s+(p.hasPaid?((p.cardId?1:0)+(p.cardId2?1:0)):0),0);
-  room.pot=Math.floor(paidCards*room.stake*(1-HOUSE_CUT));
+  const grossPot=paidCards*room.stake;                          // total stakes collected (gross)
+  room.pot=Math.floor(grossPot*(1-HOUSE_CUT));                  // 80% prize pool shown to players
   room.calledNumbers=[]; room.availableNumbers=Array.from({length:75},(_,i)=>i+1);
   room.claimedThisRound=[]; room.claimWindowOpen=false;
-  if(db){try{room.dbGameId=await db.saveGame(room.roomId,room.stakeId,room.stake,room.pot);}catch(e){}}
+  if(db){try{room.dbGameId=await db.saveGame(room.roomId,room.stakeId,room.stake,grossPot);}catch(e){}}
 
   room.players.forEach(p=>{
     if(p.cardId||p.cardId2){
@@ -429,7 +469,17 @@ async function endGame(room, winners, customMsg, noWinner){
     }
   }
 
-  if(db&&room.dbGameId){try{await db.endGame(room.dbGameId,winnerTids,winAmount,winners.length>1,room.calledNumbers);}catch(e){}}
+  if(db&&room.dbGameId){
+    try{await db.endGame(room.dbGameId,winnerTids,winAmount,winners.length>1,room.calledNumbers);}
+    catch(e){console.error('endGame DB error:',e.message);}
+  } else if(db&&!room.dbGameId){
+    // saveGame failed earlier — create+close the record now so it never stays 'playing'
+    try{
+      const grossPot=room.players.reduce((s,p)=>s+(p.hasPaid?((p.cardId?1:0)+(p.cardId2?1:0)):0),0)*room.stake;
+      const gid=await db.saveGame(room.roomId,room.stakeId,room.stake,grossPot);
+      await db.endGame(gid,winnerTids,winAmount,winners.length>1,room.calledNumbers);
+    }catch(e){console.error('endGame fallback DB error:',e.message);}
+  }
 
   const isSplit=winners&&winners.length>1;
   const msg=customMsg||(noWinner?'No winner this round':
@@ -481,9 +531,22 @@ wss.on('connection',(ws)=>{
 
   ws.on('message',async raw=>{
     try{
-      const msg=JSON.parse(raw);
       const client=clients[ws._pid];
       if(!client) return;
+
+      // ── Rate limiting: max 15 messages/sec per connection ──
+      // Protects against spam/DoS and prevents one misbehaving client
+      // (buggy or malicious) from hogging CPU when 400 people are connected.
+      const now=Date.now();
+      if(!client._rl||now-client._rl.windowStart>1000){
+        client._rl={windowStart:now,count:0};
+      }
+      client._rl.count++;
+      if(client._rl.count>15){
+        return; // silently drop excess messages this second
+      }
+
+      const msg=JSON.parse(raw);
 
       switch(msg.type){
         case 'telegramAuth':{
@@ -571,8 +634,10 @@ if(!ep&&msg.telegramId){
           const p=room.players.find(p=>p.playerId===client.playerId);
           if(!p) break;
           // Charge only on first card pick; second card charges at game start
+          // Track which card IDs changed so we only broadcast the diff, not all 400 cards
+          const changedIds=new Set([cardId]);
     if(slot===1){
-  if(p.cardId) room.takenCardIds.delete(p.cardId);
+  if(p.cardId) {room.takenCardIds.delete(p.cardId); changedIds.add(p.cardId);}
   if(client.balance<room.stake) return send(ws,{type:'error',message:`Need ${room.stake} ETB. Please deposit.`});
   if(!p.hasPaid){
     client.balance-=room.stake; p.hasPaid=true;
@@ -585,7 +650,7 @@ if(!ep&&msg.telegramId){
             send(ws,{type:'cardSelected',cardId,cardNumbers:card.numbers,slot:1});
           } else {
             // Second card — check balance for extra stake, charge now
-            if(p.cardId2) room.takenCardIds.delete(p.cardId2);
+            if(p.cardId2) {room.takenCardIds.delete(p.cardId2); changedIds.add(p.cardId2);}
             if(client.balance<room.stake) return send(ws,{type:'error',message:`Need ${room.stake} ETB more for second card.`});
             client.balance-=room.stake;
             await saveBalance(client.telegramId,client.balance);
@@ -595,7 +660,7 @@ if(!ep&&msg.telegramId){
             const card=getCard(cardId);
             send(ws,{type:'cardSelected',cardId,cardNumbers:card.numbers,slot:2});
           }
-          broadcastCardPool(room);
+          broadcastCardDiff(room,Array.from(changedIds));
 const readyCount=room.players.filter(p=>p.cardId).length;
 if(readyCount>=2&&room.status==='waiting') startCountdown(room);
 break;
@@ -607,16 +672,19 @@ break;
           const p=room.players.find(p=>p.playerId===client.playerId);
           if(!p) break;
           if(msg.slot===2&&p.cardId2){
+            const releasedId=p.cardId2;
             room.takenCardIds.delete(p.cardId2); p.cardId2=null;
             // Refund second card stake
             client.balance+=room.stake;
             await saveBalance(client.telegramId,client.balance);
             if(db&&client.telegramId){try{await db.logTx(client.telegramId,'stake_refund',room.stake,client.balance,room.roomId);}catch(e){}}
             send(ws,{type:'balanceUpdate',balance:client.balance});
+            broadcastCardDiff(room,[releasedId]); break;
           } else if(msg.slot===1&&p.cardId){
+            const releasedIds=[p.cardId];
             room.takenCardIds.delete(p.cardId); p.cardId=null;
             // If had second card, promote it to card1, refund would be complex so just clear both
-            if(p.cardId2){room.takenCardIds.delete(p.cardId2);p.cardId2=null;
+            if(p.cardId2){releasedIds.push(p.cardId2);room.takenCardIds.delete(p.cardId2);p.cardId2=null;
               client.balance+=room.stake;
               await saveBalance(client.telegramId,client.balance);
               if(db&&client.telegramId){try{await db.logTx(client.telegramId,'stake_refund',room.stake,client.balance,room.roomId);}catch(e){}}
@@ -627,8 +695,9 @@ break;
             await saveBalance(client.telegramId,client.balance);
             if(db&&client.telegramId){try{await db.logTx(client.telegramId,'stake_refund',room.stake,client.balance,room.roomId);}catch(e){}}
             send(ws,{type:'balanceUpdate',balance:client.balance});
+            broadcastCardDiff(room,releasedIds); break;
           }
-          broadcastCardPool(room); break;
+          break;
         }
         case 'claimBingo':{
           if(!client.roomId) return;
@@ -717,40 +786,28 @@ function adminAuth(req,res,next){
   if(cl&&cl.isAdmin) return next();
   res.status(403).json({error:'Forbidden'});
 }
-
-app.get('/api/admin/admins', adminAuth, async(req,res)=>{
-  if(!db) return res.json([]);
-  try{
-    const rows=await db.q('SELECT telegram_id,name,phone FROM users WHERE is_admin=true ORDER BY name');
-    res.json(rows);
-  }catch(e){ res.status(500).json({error:e.message}); }
+app.get('/api/admin/admins',adminAuth,async(req,res)=>{
+  if(!db)return res.json([]);
+  res.json(await db.q('SELECT telegram_id,name,phone FROM users WHERE is_admin=true ORDER BY name'));
 });
-app.post('/api/admin/admins', adminAuth, async(req,res)=>{
-  if(!db) return res.json({ok:true});
+app.post('/api/admin/admins',adminAuth,async(req,res)=>{
+  if(!db)return res.json({ok:true});
   const phone=String(req.body.phone||'').trim().replace(/^\+/,'');
-  if(!phone) return res.status(400).json({error:'phone required'});
-  try{
-    const r=await db.q('UPDATE users SET is_admin=true WHERE phone=$1 RETURNING telegram_id,name,phone',[phone]);
-    if(!r.length) return res.status(404).json({error:'User not found'});
-    const cl=Object.values(clients).find(c=>c.telegramId===String(r[0].telegram_id));
-    if(cl) cl.isAdmin=true;
-    if(userCache[String(r[0].telegram_id)]) userCache[String(r[0].telegram_id)].isAdmin=true;
-    res.json({ok:true,user:r[0]});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  if(!phone)return res.status(400).json({error:'phone required'});
+  const r=await db.q('UPDATE users SET is_admin=true WHERE phone=$1 RETURNING telegram_id,name,phone',[phone]);
+  if(!r.length)return res.status(404).json({error:'User not found'});
+  const cl=Object.values(clients).find(c=>c.telegramId===String(r[0].telegram_id));
+  if(cl)cl.isAdmin=true;
+  res.json({ok:true,user:r[0]});
 });
-app.delete('/api/admin/admins/:phone', adminAuth, async(req,res)=>{
-  if(!db) return res.json({ok:true});
+app.delete('/api/admin/admins/:phone',adminAuth,async(req,res)=>{
+  if(!db)return res.json({ok:true});
   const phone=decodeURIComponent(req.params.phone).replace(/^\+/,'');
-  if(phone===ADMIN_PHONE) return res.status(403).json({error:'Cannot remove root admin'});
-  try{
-    const r=await db.q('UPDATE users SET is_admin=false WHERE phone=$1 RETURNING telegram_id',[phone]);
-    if(r[0]){
-      const cl=Object.values(clients).find(c=>c.telegramId===String(r[0].telegram_id));
-      if(cl) cl.isAdmin=false;
-      if(userCache[String(r[0].telegram_id)]) userCache[String(r[0].telegram_id)].isAdmin=false;
-    }
-    res.json({ok:true});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  if(phone===ADMIN_PHONE)return res.status(403).json({error:'Cannot remove root admin'});
+  await db.q('UPDATE users SET is_admin=false WHERE phone=$1',[phone]);
+  const cl=Object.values(clients).find(c=>{const u=userCache[c.telegramId];return u&&u.phone===phone;});
+  if(cl)cl.isAdmin=false;
+  res.json({ok:true});
 });
 
 app.get('/api/admin/deposits', adminAuth, async(req,res)=>{
@@ -799,6 +856,98 @@ app.post('/api/admin/withdrawals/:id/reject', adminAuth, async(req,res)=>{
 app.get('/api/admin/search', adminAuth, async(req,res)=>{
   if(!db) return res.json([]);
   res.json(await db.searchByPhone(req.query.phone||''));
+});
+
+app.get('/api/admin/analytics', adminAuth, async(req,res)=>{
+  if(!db) return res.json({error:'No database'});
+  const { from, to } = req.query;
+  const dateFrom = from ? new Date(from).toISOString() : new Date(Date.now()-30*86400000).toISOString();
+  const dateTo   = to   ? new Date(new Date(to).setHours(23,59,59,999)).toISOString() : new Date().toISOString();
+  try {
+    const games = await db.q(
+      `SELECT COUNT(*)::int as total_games,
+              COALESCE(SUM(pot),0)::numeric as total_pot,
+              COALESCE(SUM(win_amount),0)::numeric as total_paid_out,
+              COUNT(CASE WHEN status='finished' THEN 1 END)::int as finished_games
+       FROM games WHERE started_at BETWEEN $1 AND $2`, [dateFrom, dateTo]);
+
+    const profit = await db.q(
+      `SELECT COALESCE(SUM(pot - COALESCE(win_amount,0)),0)::numeric as house_profit
+       FROM games WHERE status='finished' AND started_at BETWEEN $1 AND $2`, [dateFrom, dateTo]);
+
+    const deposits = await db.q(
+      `SELECT COUNT(*)::int as total,
+              COUNT(CASE WHEN status='pending' THEN 1 END)::int as pending,
+              COUNT(CASE WHEN status='approved' THEN 1 END)::int as approved,
+              COUNT(CASE WHEN status='rejected' THEN 1 END)::int as rejected,
+              COALESCE(SUM(CASE WHEN status='approved' THEN amount ELSE 0 END),0)::numeric as approved_amount,
+              COALESCE(SUM(CASE WHEN status='pending' THEN amount ELSE 0 END),0)::numeric as pending_amount
+       FROM deposit_requests WHERE created_at BETWEEN $1 AND $2`, [dateFrom, dateTo]);
+
+    const withdrawals = await db.q(
+      `SELECT COUNT(*)::int as total,
+              COUNT(CASE WHEN status='pending' THEN 1 END)::int as pending,
+              COUNT(CASE WHEN status='approved' THEN 1 END)::int as approved,
+              COUNT(CASE WHEN status='rejected' THEN 1 END)::int as rejected,
+              COALESCE(SUM(CASE WHEN status='approved' THEN amount ELSE 0 END),0)::numeric as approved_amount,
+              COALESCE(SUM(CASE WHEN status='pending' THEN amount ELSE 0 END),0)::numeric as pending_amount
+       FROM withdrawal_requests WHERE created_at BETWEEN $1 AND $2`, [dateFrom, dateTo]);
+
+    const users = await db.q(
+      `SELECT COUNT(*)::int as new_users FROM users WHERE created_at BETWEEN $1 AND $2`, [dateFrom, dateTo]);
+
+    const totalUsers = await db.q(`SELECT COUNT(*)::int as count FROM users`);
+
+    const dailyRevenue = await db.q(
+      `SELECT DATE(started_at) as day,
+              COUNT(*)::int as games,
+              COALESCE(SUM(pot - COALESCE(win_amount,0)),0)::numeric as profit,
+              COALESCE(SUM(pot),0)::numeric as pot
+       FROM games WHERE status='finished' AND started_at BETWEEN $1 AND $2
+       GROUP BY DATE(started_at) ORDER BY day ASC`, [dateFrom, dateTo]);
+
+    const topWinners = await db.q(
+      `SELECT u.name, u.phone,
+              COUNT(CASE WHEN t.type='win' THEN 1 END)::int as wins,
+              COALESCE(SUM(CASE WHEN t.type='win' THEN t.amount ELSE 0 END),0)::numeric as total_won
+       FROM users u JOIN transactions t ON t.user_id=u.id
+       WHERE t.created_at BETWEEN $1 AND $2 AND t.type='win'
+       GROUP BY u.id, u.name, u.phone
+       ORDER BY total_won DESC LIMIT 10`, [dateFrom, dateTo]);
+
+    const recentTx = await db.q(
+      `SELECT u.name, u.phone, t.type, t.amount, t.created_at
+       FROM transactions t JOIN users u ON u.id=t.user_id
+       WHERE t.created_at BETWEEN $1 AND $2
+       ORDER BY t.created_at DESC LIMIT 20`, [dateFrom, dateTo]);
+
+    const pendingDeposits = await db.q(
+      `SELECT dr.id, dr.amount, dr.tx_ref, dr.created_at, u.name, u.phone
+       FROM deposit_requests dr JOIN users u ON u.id=dr.user_id
+       WHERE dr.status='pending' ORDER BY dr.created_at ASC LIMIT 20`);
+
+    const pendingWithdrawals = await db.q(
+      `SELECT wr.id, wr.amount, wr.created_at, u.name, u.phone
+       FROM withdrawal_requests wr JOIN users u ON u.id=wr.user_id
+       WHERE wr.status='pending' ORDER BY wr.created_at ASC LIMIT 20`);
+
+    res.json({
+      range: { from: dateFrom, to: dateTo },
+      games: games[0],
+      profit: profit[0],
+      deposits: deposits[0],
+      withdrawals: withdrawals[0],
+      users: { ...users[0], total: totalUsers[0].count },
+      dailyRevenue,
+      topWinners,
+      recentTx,
+      pendingDeposits,
+      pendingWithdrawals
+    });
+  } catch(e) {
+    console.error('Analytics error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── Payment info (Telebirr account shown on deposit page) ──
