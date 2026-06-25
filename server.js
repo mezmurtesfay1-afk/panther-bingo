@@ -994,6 +994,15 @@ function startTelegramBot(){
   if(!TOKEN){console.log('ℹ️ No BOT_TOKEN');return;}
   let Bot; try{Bot=require('node-telegram-bot-api');}catch(e){console.log('ℹ️ Bot lib missing');return;}
   const bot=new Bot(TOKEN,{polling:true}), pending={};
+  bot.setChatMenuButton({
+  menu_button: {
+    type: 'web_app',
+    text: '🎮 Play',
+    web_app: {
+      url: GAME_URL
+    }
+  }
+});
 
   const MAIN_MENU = {
     keyboard: [
