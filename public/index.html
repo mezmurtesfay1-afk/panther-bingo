@@ -475,14 +475,15 @@ body{background:var(--bg);color:#fff;font-family:'Inter',sans-serif;padding-bott
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
         <div>
           <label style="font-size:11px;color:var(--gray);display:block;margin-bottom:4px">From</label>
-          <input type="date" id="analyticsFrom" class="form-input" style="font-size:13px;padding:8px 10px">
+          <input type="datetime-local" id="analyticsFrom" class="form-input" style="font-size:13px;padding:8px 10px">
         </div>
         <div>
           <label style="font-size:11px;color:var(--gray);display:block;margin-bottom:4px">To</label>
-          <input type="date" id="analyticsTo" class="form-input" style="font-size:13px;padding:8px 10px">
+          <input type="datetime-local" id="analyticsTo" class="form-input" style="font-size:13px;padding:8px 10px">
         </div>
       </div>
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+        <button onclick="analyticsSetRange('6h')" class="refresh-btn" style="margin:0;font-size:11px;padding:5px 10px">Last 6h</button>
         <button onclick="analyticsSetRange('today')" class="refresh-btn" style="margin:0;font-size:11px;padding:5px 10px">Today</button>
         <button onclick="analyticsSetRange('7d')" class="refresh-btn" style="margin:0;font-size:11px;padding:5px 10px">Last 7d</button>
         <button onclick="analyticsSetRange('30d')" class="refresh-btn" style="margin:0;font-size:11px;padding:5px 10px">Last 30d</button>
@@ -1596,14 +1597,25 @@ document.getElementById('depositTxRef').addEventListener('input', function(){
 // ─── ANALYTICS ───────────────────────────────────────────────
 function analyticsSetRange(preset){
   const now=new Date();
-  const fmt=d=>d.toISOString().slice(0,10);
-  const todayStr=fmt(now);
-  let from, to=todayStr;
-  if(preset==='today'){ from=todayStr; }
-  else if(preset==='7d'){ const d=new Date(now); d.setDate(d.getDate()-6); from=fmt(d); }
-  else if(preset==='30d'){ const d=new Date(now); d.setDate(d.getDate()-29); from=fmt(d); }
-  else if(preset==='month'){ from=fmt(new Date(now.getFullYear(),now.getMonth(),1)); }
-  else if(preset==='all'){ from='2020-01-01'; }
+  const pad=n=>String(n).padStart(2,'0');
+  const fmtDT=d=>`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  let from, to=fmtDT(now);
+  if(preset==='6h'){
+    const d=new Date(now); d.setHours(d.getHours()-6);
+    from=fmtDT(d);
+  } else if(preset==='today'){
+    from=fmtDT(new Date(now.getFullYear(),now.getMonth(),now.getDate(),0,0));
+  } else if(preset==='7d'){
+    const d=new Date(now); d.setDate(d.getDate()-6); d.setHours(0,0,0,0);
+    from=fmtDT(d);
+  } else if(preset==='30d'){
+    const d=new Date(now); d.setDate(d.getDate()-29); d.setHours(0,0,0,0);
+    from=fmtDT(d);
+  } else if(preset==='month'){
+    from=fmtDT(new Date(now.getFullYear(),now.getMonth(),1,0,0));
+  } else if(preset==='all'){
+    from='2020-01-01T00:00';
+  }
   document.getElementById('analyticsFrom').value=from;
   document.getElementById('analyticsTo').value=to;
 }
@@ -1615,7 +1627,7 @@ async function loadAnalytics(){
   if(!from||!to){ showToast('Select a date range first','error'); return; }
   content.innerHTML='<div class="empty-state" style="padding:30px 0">⏳ Loading report...</div>';
   try{
-    const res=await fetch(`/api/admin/analytics?from=${from}&to=${to}`,{headers:{'x-admin-token':adminToken}});
+    const res=await fetch(`/api/admin/analytics?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,{headers:{'x-admin-token':adminToken}});
     const d=await res.json();
     if(d.error){ content.innerHTML=`<div class="empty-state" style="color:var(--red)">${esc(d.error)}</div>`; return; }
     renderAnalytics(d, from, to);
@@ -1746,7 +1758,7 @@ function renderAnalytics(d, from, to){
   document.getElementById('analyticsContent').innerHTML=`
     <!-- Period header -->
     <div style="text-align:center;margin-bottom:12px;font-size:11px;color:var(--gray)">
-      Report: <strong style="color:#fff">${from}</strong> → <strong style="color:#fff">${to}</strong>
+      Report: <strong style="color:#fff">${new Date(from).toLocaleString()}</strong> → <strong style="color:#fff">${new Date(to).toLocaleString()}</strong>
     </div>
 
     <!-- KPI grid -->
@@ -1796,13 +1808,14 @@ connect();
 loadPaymentInfo();
 // Set default analytics range to last 30 days
 (()=>{
-  const fmt=d=>d.toISOString().slice(0,10);
   const now=new Date();
-  const d30=new Date(now); d30.setDate(d30.getDate()-29);
+  const d30=new Date(now); d30.setDate(d30.getDate()-29); d30.setHours(0,0,0,0);
+  const pad=n=>String(n).padStart(2,'0');
+  const fmtDT=d=>`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
   const fromEl=document.getElementById('analyticsFrom');
   const toEl=document.getElementById('analyticsTo');
-  if(fromEl) fromEl.value=fmt(d30);
-  if(toEl) toEl.value=fmt(now);
+  if(fromEl) fromEl.value=fmtDT(d30);
+  if(toEl) toEl.value=fmtDT(now);
 })();
 </script>
 </body>
